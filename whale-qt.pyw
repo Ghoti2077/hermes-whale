@@ -42,8 +42,8 @@ FOLLOW_HERMES = True    # show only while the Hermes desktop app is running
 HERMES_EXE = "Hermes.exe"
 FOLLOW_POLL_S = 2       # how often to re-check Hermes (ctypes, so this is cheap)
 CREATE_NO_WINDOW = 0x08000000   # keep tasklist from flashing a console
-# Art ships with the repo (art/whale.png) — no external path needed.
-ART = Path(__file__).resolve().parent / "art" / "whale.png"
+_ART_RAW = Path(r"D:\APP\herness\profiles\web\node_modules\dsh-whale-widget\assets\DSniang1.png")
+ART = _ART_RAW
 IMG_W = 220             # on-screen width of the art (and of the window)
 ART_TOP = 0.42          # where the character starts; the bubble lives above it
 SIZE_W = IMG_W
@@ -66,6 +66,7 @@ BUBBLE_DOTS = (
 )
 ART_TOP = 0.42          # where the character starts; the bubble lives above it
 BALANCE_FONT_PX = 21    # the balance readout
+SPENT_HOLD_S = 1.5      # after a click, show today's spend for this many seconds
 INSET = 0.94            # draw content scaled to this share, so the tap-squash
                         # (which grows vertically) never clips at the window top
 FLING_FRICTION = 0.94
@@ -109,9 +110,11 @@ def fetch_balance() -> dict:
         return {"error": type(e).__name__}
     info = (d.get("balance_infos") or [{}])[0]
     try:
-        return {"total": float(info.get("total_balance") or 0),
+        total = float(info.get("total_balance") or 0)
+        return {"total": total,
                 "granted": float(info.get("granted_balance") or 0),
-                "topped_up": float(info.get("topped_up_balance") or 0)}
+                "topped_up": float(info.get("topped_up_balance") or 0),
+                **_record_observation(total)}
     except Exception:
         return {"error": "解析失败"}
 
@@ -121,6 +124,7 @@ def fetch_balance() -> dict:
 # can go through QSoundEffect. QMediaPlayer decodes mp3 but rebuilds its pipeline
 # on each play — that rebuild is the stutter heard on repeated clicks.
 SFX_DIR = Path(__file__).resolve().parent / "sfx"
+ASSETS = ART.parent          # the shipped exp-orb wav lives with the art
 SFX_VOLUME = 0.8        # 0..1
 
 # event -> file. Back to the widget's own paired cues: she asked for these by
@@ -134,8 +138,11 @@ VOICES_PER_SAMPLE = 4   # rapid clicks overlap; one instance restarts and stutte
 
 
 def _find_sfx(name: str) -> Path | None:
-    p = SFX_DIR / name
-    return p if p.exists() else None
+    for base in (SFX_DIR, ASSETS):
+        p = base / name
+        if p.exists():
+            return p
+    return None
 
 
 class Sfx:
@@ -189,6 +196,52 @@ class Sfx:
         i = self._slot.get(name, 0)
         vs[i].play()
         self._slot[name] = (i + 1) % len(vs)   # rotate voices so clicks never cut each other off
+
+
+# ------------------------------------------------------------------ ledger
+# Same accounting rule as dashboard/plugin_api.py: a DROP in balance counts as
+# spend, a RISE is a top-up (tracked separately so it never cancels observed
+# spend), and the first reading of a day is the baseline rather than spending.
+# DeepSeek exposes no "today's usage" endpoint, so this is the only way to know.
+LEDGER = Path(__file__).resolve().parent / "usage.json"
+KEEP_DAYS = 90
+
+
+def _load_ledger() -> dict:
+    try:
+        return json.loads(LEDGER.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_ledger(led: dict) -> None:
+    try:
+        LEDGER.write_text(json.dumps(led, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass          # a read-only folder must not break the display
+
+
+def _record_observation(total: float) -> dict:
+    """Fold one balance reading into today's ledger."""
+    today = time.strftime("%Y-%m-%d")
+    led = _load_ledger()
+    day = led.get(today) or {"since": None, "spent": 0.0, "topup": 0.0, "last": None}
+
+    if day["last"] is None:
+        day["since"] = total          # first reading = baseline, no spend inferred
+    else:
+        delta = day["last"] - total
+        if delta > 0:                 # balance dropped -> spend
+            day["spent"] = round(day["spent"] + delta, 8)
+        elif delta < 0:               # balance rose -> top-up / grant
+            day["topup"] = round(day["topup"] - delta, 8)
+    day["last"] = total
+
+    led[today] = day
+    for stale in sorted(led)[:-KEEP_DAYS]:
+        led.pop(stale, None)
+    _save_ledger(led)
+    return {"today_spent": day["spent"], "today_topup": day["topup"]}
 
 
 def yuan(v: float) -> str:
@@ -335,6 +388,9 @@ class Whale(QWidget):
         self._edges: tuple[int, int] | None = None
         self._follow_ticks = 0
         self._hidden = False
+        self._show_spent = False            # bubble currently showing today's spend
+        self._spent_timer: QTimer | None = None
+        self.today_spent: float | None = None
 
         # park bottom-right of the available area
         geo = QApplication.primaryScreen().availableGeometry()
@@ -396,7 +452,9 @@ class Whale(QWidget):
         p.drawEllipse(box)
 
         has_bal = bool(self.bal and "total" in self.bal)
-        if has_bal:
+        if self._show_spent and self.today_spent is not None:
+            main = f"今日 {yuan(self.today_spent)}"      # click-to-peek
+        elif has_bal:
             main = yuan(self.bal["total"])
         elif self.bal and "error" in self.bal:
             main = self.bal["error"]
@@ -432,9 +490,22 @@ class Whale(QWidget):
             return
         gp = e.globalPosition().toPoint()
         self.move(self._win0 + (gp - self._grab))
+
         now = time.time()
         self._samples.append((now, gp.x(), gp.y()))
         self._samples = [s for s in self._samples if now - s[0] < 0.15][-6:]
+
+        # Turn on SUSTAINED direction, not on distance from where the drag started.
+        # A shaky hand reverses every sample or two; requiring three consecutive
+        # same-way steps means she only turns when the motion is real — and turns
+        # immediately, because no distance threshold has to be crossed first.
+        recent = self._samples[-4:]
+        if len(recent) >= 3:
+            steps = [recent[i + 1][1] - recent[i][1] for i in range(len(recent) - 1)]
+            if all(s <= 0 for s in steps) and any(s < 0 for s in steps):
+                self.mirror = True      # pulling her left → she faces right
+            elif all(s >= 0 for s in steps) and any(s > 0 for s in steps):
+                self.mirror = False
         # No update() here: Qt already repaints the widget on move(), and a full
         # repaint per mouse event is what made dragging feel choppy.
 
@@ -551,6 +622,22 @@ class Whale(QWidget):
         # and the pair read as one sound. Wait for Ya1 to finish instead.
         QTimer.singleShot(250, lambda: self.sfx.play("release"))
 
+        # Swap the bubble to today's spend for SPENT_HOLD_S seconds, then let it
+        # fall back to the balance on its own.
+        self._show_spent = True
+        if self._spent_timer is not None:
+            self._spent_timer.stop()
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(self._end_spent_peek)
+        t.start(int(SPENT_HOLD_S * 1000))
+        self._spent_timer = t
+        self.update()
+
+    def _end_spent_peek(self) -> None:
+        self._show_spent = False
+        self.update()
+
     def _squash_to(self, target: float) -> None:
         if self._anim:
             self._anim.stop()
@@ -629,6 +716,8 @@ class Whale(QWidget):
         self._fetching = False
         was = self.bal
         self.bal = out
+        if "today_spent" in out:
+            self.today_spent = out["today_spent"]
         # exp-orb when the number actually moved (the widget's "task finished" cue)
         if "total" in out and (was is None or was.get("total") != out["total"]):
             self.sfx.play("task")
