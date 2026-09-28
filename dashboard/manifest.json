@@ -1,0 +1,8 @@
+{
+  "name": "deepseek-whale",
+  "label": "DeepSeek Whale",
+  "description": "DeepSeek 余额小鲸鱼 — 状态栏显示账户余额",
+  "icon": "Graph",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
