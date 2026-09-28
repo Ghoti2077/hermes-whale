@@ -1,0 +1,18 @@
+# Runtime junk — these are generated on the user's machine, never committed
+whale-error.log
+whale.lock
+usage.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
