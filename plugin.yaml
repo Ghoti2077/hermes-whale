@@ -1,0 +1,4 @@
+name: deepseek-whale
+version: 1.0.0
+description: DeepSeek 余额小鲸鱼 — 在桌面状态栏显示账户余额（移植自 DSH 的 Balance Whale Widget）
+author: Ghoti
